@@ -1,80 +1,125 @@
-from fastapi import FastAPI
-from pydantic import BaseModel
+import os
+import json
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-import uvicorn
+from pydantic import BaseModel
+from dotenv import load_dotenv
+import openai
 from argopy import DataFetcher
-import re
 
-# --- Setup FastAPI ---
+# Load API key
+load_dotenv()
+openai.api_key = os.getenv("OPENAI_API_KEY")
+
+# FastAPI app
 app = FastAPI()
 
-# Allow frontend (your HTML) to talk to backend
+# Allow frontend calls
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # you can restrict this later
-    allow_credentials=True,
+    allow_origins=["*"],
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# --- Request/Response Models ---
-class QueryRequest(BaseModel):
+# Request body
+class Query(BaseModel):
     query: str
 
-class QueryResponse(BaseModel):
-    answer: str
-    visualization_data: dict | None = None
 
-# --- Helper: parse query ---
-def parse_query(query: str):
-    """Very basic keyword parser for demo."""
-    if "temperature" in query.lower():
-        return "temperature"
-    elif "salinity" in query.lower():
-        return "salinity"
-    elif "float" in query.lower():
-        return "floats"
-    return "general"
+# --- Step 1: Parse query into filters using LLM ---
+def parse_query_to_filters(q: str):
+    parser_prompt = [
+        {"role": "system", "content": "Extract filters for Argo float data queries. Always return JSON."},
+        {"role": "user", "content": f"User asked: '{q}'. "
+         "Return JSON with keys: region (array of 4 floats [lon_min, lon_max, lat_min, lat_max]), "
+         "depth_min (float), depth_max (float), "
+         "date_min (YYYY-MM), date_max (YYYY-MM)."}
+    ]
 
-# --- API Endpoint ---
-@app.post("/ask", response_model=QueryResponse)
-def ask(request: QueryRequest):
-    query = request.query
-    intent = parse_query(query)
+    resp = openai.ChatCompletion.create(
+        model="gpt-3.5-turbo",
+        messages=parser_prompt,
+        temperature=0
+    )
+    parsed_text = resp["choices"][0]["message"]["content"]
 
     try:
-        if intent == "temperature":
-            # Example: Fetch global Argo temperature profiles
-            ds = DataFetcher().profile(selection=dict(lat=[-10,10], lon=[120,160], depth=[0,10])).to_xarray()
-            temp = float(ds['TEMP'].mean())
-            answer = f"Average sea temperature in the region is about {temp:.2f} °C."
-            return QueryResponse(answer=answer)
+        filters = json.loads(parsed_text)
+    except Exception:
+        # Default fallback
+        filters = {
+            "region": [-60, -30, 20, 40],
+            "depth_min": 0,
+            "depth_max": 2000,
+            "date_min": "2023-01",
+            "date_max": "2023-12"
+        }
+    return filters
 
-        elif intent == "salinity":
-            ds = DataFetcher().profile(selection=dict(lat=[-10,10], lon=[120,160], depth=[0,10])).to_xarray()
-            sal = float(ds['PSAL'].mean())
-            answer = f"Average salinity in the region is about {sal:.2f} PSU."
-            return QueryResponse(answer=answer)
 
-        elif intent == "floats":
-            # Fetch latest float positions
-            df = DataFetcher().float([6902746, 6902914]).to_dataframe()
-            floats = df.groupby("N_PROF").first().reset_index()
-            markers = [
-                {"lat": float(row["LATITUDE"]), "lon": float(row["LONGITUDE"]), "id": int(row["PLATFORM_NUMBER"])}
-                for _, row in floats.iterrows()
-            ]
-            return QueryResponse(
-                answer=f"I found {len(markers)} Argo floats in the dataset.",
-                visualization_data={"markers": markers}
-            )
-
-        else:
-            return QueryResponse(answer="I can help you with ocean temperature, salinity, or float locations. Try asking me one of those!")
-
+# --- Step 2: Fetch Argo data (using ERDDAP backend) ---
+def fetch_argo_data(region, depth_min=0, depth_max=2000,
+                    date_min="2023-01", date_max="2023-12", limit=10):
+    try:
+        argo = DataFetcher(src="erddap").region([*region, depth_min, depth_max, date_min, date_max])
+        ds = argo.to_xarray().isel(N_PROF=slice(0, limit))
+        df = ds.to_dataframe().reset_index()
     except Exception as e:
-        return QueryResponse(answer=f"Error while fetching data: {str(e)}")
+        print("⚠️ Argo fetch failed:", e)
+        return [], []
 
-# --- Run Server ---
-if __name__ == "__main__":
-    uvicorn.run(app, host="127.0.0.1", port=8000)
+    summaries, viz = [], []
+    for _, row in df.iterrows():
+        try:
+            text = (
+                f"Float {row['N_PROF']} on {row['JULD']} at "
+                f"{row['LATITUDE']}N, {row['LONGITUDE']}E "
+                f"depth {row['PRES']}m: T={row['TEMP']}°C, S={row['PSAL']} PSU"
+            )
+            summaries.append(text)
+            viz.append({
+                "lat": row["LATITUDE"],
+                "lon": row["LONGITUDE"],
+                "depth": row["PRES"],
+                "temp": row["TEMP"],
+                "salinity": row["PSAL"]
+            })
+        except Exception:
+            continue
+
+    return summaries, viz
+
+
+# --- Step 3: Main API endpoint ---
+@app.post("/ask")
+def ask_backend(item: Query):
+    q = item.query
+
+    # Parse filters from query
+    filters = parse_query_to_filters(q)
+
+    # Fetch matching data
+    data_texts, viz_data = fetch_argo_data(
+        region=filters["region"],
+        depth_min=filters["depth_min"],
+        depth_max=filters["depth_max"],
+        date_min=filters["date_min"],
+        date_max=filters["date_max"]
+    )
+
+    if not data_texts:
+        return {"answer": "No Argo data found for your request.", "visualization_data": []}
+
+    # Summarize with LLM
+    llm_prompt = [
+        {"role": "system", "content": "You are an oceanography expert."},
+        {"role": "user", "content": f"Answer the query: {q}. Here is the data: {data_texts}"}
+    ]
+    answer = openai.ChatCompletion.create(
+        model="gpt-3.5-turbo",
+        messages=llm_prompt,
+        temperature=0.5
+    )["choices"][0]["message"]["content"]
+
+    return {"answer": answer, "visualization_data": viz_data}
